@@ -5,8 +5,9 @@ settings = Settings()
 
 engine = create_async_engine(
     settings.database_url,
-    echo = True,
     pool_pre_ping=True,
+    pool_size=50,
+    max_overflow=0,
 )
 
 SessionLocal = async_sessionmaker(

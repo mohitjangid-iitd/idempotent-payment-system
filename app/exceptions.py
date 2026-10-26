@@ -9,3 +9,6 @@ class AccountNotFound(Exception):
 
 class UserAlreadyExists(Exception):
     pass
+
+class InvalidTransfer(Exception):
+    pass

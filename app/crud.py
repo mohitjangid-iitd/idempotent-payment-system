@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.models import User, Transfer
-from app.exceptions import AccountNotFound, InsufficientBalance, BalanceNotZero
+from app.exceptions import AccountNotFound, InsufficientBalance, BalanceNotZero, InvalidTransfer
 
 def _active(stmt):
     return stmt.where(User.deleted_at.is_(None))
@@ -30,14 +30,15 @@ async def create_user(session: AsyncSession, name: str) -> User:
     await session.refresh(user)
     return user
 
-async def update_user_name(session: AsyncSession, user_id: int, name: str) -> Optional[User]:
+async def update_user_name(session: AsyncSession, user_id: int, name: str) -> User:
     user = await get_user(session, user_id)
-    if user:
-        user.name = name
-        await session.commit()
-        await session.refresh(user)
-        return user
-    raise AccountNotFound()
+    if user is None:
+        raise AccountNotFound()
+    
+    user.name = name
+    await session.commit()
+    await session.refresh(user)
+    return user
 
 async def delete_user(session: AsyncSession, user_id: int) -> User:
     user = await get_user(session, user_id)
@@ -78,7 +79,7 @@ async def debit_user(session: AsyncSession, user_id: int, amount: int) -> User:
 
 async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, amount: int) -> Transfer:
     if from_user_id == to_user_id:
-        raise ValueError("Self transfer is not allowed")
+        raise InvalidTransfer()
     
     if amount <= 0:
         raise ValueError("Amount must be positive")

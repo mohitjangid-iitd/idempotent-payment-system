@@ -55,7 +55,7 @@ async def delete_user(session: AsyncSession, user_id: int) -> User:
 
 async def credit_user(session: AsyncSession, user_id: int, amount: int) -> User:
     if amount <= 0:
-        raise ValueError("Amount must be positive")
+        raise InvalidTransfer()
     user = await get_user(session, user_id)
     if user:
         user.balance += amount
@@ -66,7 +66,7 @@ async def credit_user(session: AsyncSession, user_id: int, amount: int) -> User:
 
 async def debit_user(session: AsyncSession, user_id: int, amount: int) -> User:
     if amount <= 0:
-        raise ValueError("Amount must be positive")
+        raise InvalidTransfer()
     user = await get_user(session, user_id)
     if user:
         if user.balance < amount:
@@ -82,7 +82,7 @@ async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, am
         raise InvalidTransfer()
     
     if amount <= 0:
-        raise ValueError("Amount must be positive")
+        raise InvalidTransfer()
 
     from_user = await get_user(session, from_user_id)
     if from_user is None:

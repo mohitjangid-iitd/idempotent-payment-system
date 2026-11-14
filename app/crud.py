@@ -1,6 +1,6 @@
 from typing import Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from app.models import User, Transfer
 from app.exceptions import AccountNotFound, InsufficientBalance, BalanceNotZero, InvalidTransfer

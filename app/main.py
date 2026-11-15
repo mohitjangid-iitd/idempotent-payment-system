@@ -3,6 +3,10 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import time, uuid
+import logging
+import structlog
+
 from app.database import get_db
 from app.schemas import (
     AccountCreate, AccountOut, AmountIn, TransferIn, 
@@ -16,8 +20,31 @@ from app.exceptions import (
     AccountNotFound, InsufficientBalance, BalanceNotZero, 
     InvalidTransfer
     )
+from app.logging_config import setup_logging
 
 app = FastAPI()
+
+# --- middlewares ---
+setup_logging()
+log = structlog.get_logger()
+
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(request_id=request_id)
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        log.exception("request_failed", log_type="ERROR",
+                      method=request.method, path=request.url.path)
+        raise
+    log.info("request", log_type="REQUEST", method=request.method,
+             path=request.url.path, status=response.status_code,
+             duration_ms=round((time.perf_counter() - start) * 1000, 1))
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 # --- global exception handlers ---
 @app.exception_handler(AccountNotFound)
@@ -83,11 +110,17 @@ async def delete_account(account_id: int, session: AsyncSession = Depends(get_db
 
 @app.post("/accounts/{account_id}/deposit", response_model=AccountOut)
 async def deposit(account_id: int, body: AmountIn, session: AsyncSession = Depends(get_db)):
-    return await credit_user(session, account_id, body.amount)
+    user = await credit_user(session, account_id, body.amount)
+    log.info("deposit_succeeded", log_type="AUDIT",
+             user_id=account_id, amount=body.amount)
+    return user
 
 @app.post("/accounts/{account_id}/withdraw", response_model=AccountOut)
 async def withdraw(account_id: int, body: AmountIn, session: AsyncSession = Depends(get_db)):
-    return await debit_user(session, account_id, body.amount)
+    user = await debit_user(session, account_id, body.amount)
+    log.info("withdraw_succeeded", log_type="AUDIT",
+             user_id=account_id, amount=body.amount)
+    return user
 
 @app.post("/transfers", response_model=TransferOut, status_code=201)
 async def create_transfer(body: TransferIn, session: AsyncSession = Depends(get_db)):

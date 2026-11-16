@@ -18,6 +18,16 @@ async def get_user(session: AsyncSession, user_id: int) -> Optional[User]:
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
 
+async def get_user_for_update(session: AsyncSession, user_id: int) -> Optional[User]:
+    stmt = _active(
+        select(User)
+        .where(User.id == user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
 async def get_user_by_name(session: AsyncSession, user_name: str) -> List[User]:
     stmt = _active(select(User).where(User.name == user_name))
     result = await session.execute(stmt)
@@ -74,7 +84,7 @@ async def _credit(session: AsyncSession, user_id: int, amount: int) -> User:
                     reason="invalid_amount", user_id=user_id, amount=amount)
         raise InvalidTransfer()
 
-    user = await get_user(session, user_id)
+    user = await get_user_for_update(session, user_id)
     if user is None:
         log.warning("credit_rejected", log_type="REJECT",
                     reason="account_not_found", user_id=user_id)
@@ -99,7 +109,7 @@ async def _debit(session: AsyncSession, user_id: int, amount: int) -> User:
                     reason="invalid_amount", user_id=user_id, amount=amount)
         raise InvalidTransfer()
 
-    user = await get_user(session, user_id)
+    user = await get_user_for_update(session, user_id)
     if user is None:
         log.warning("debit_rejected", log_type="REJECT",
                     reason="account_not_found", user_id=user_id)
@@ -135,12 +145,12 @@ async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, am
                     reason="invalid_amount", sender_id=from_user_id, amount=amount)
         raise InvalidTransfer()
 
-    if await get_user(session, from_user_id) is None:
+    if await get_user_for_update(session, from_user_id) is None:
         log.warning("transfer_rejected", log_type="REJECT",
                     reason="sender_not_found", sender_id=from_user_id)
         raise AccountNotFound()
 
-    if await get_user(session, to_user_id) is None:
+    if await get_user_for_update(session, to_user_id) is None:
         log.warning("transfer_rejected", log_type="REJECT",
                     reason="receiver_not_found", receiver_id=to_user_id)
         raise AccountNotFound()
@@ -160,6 +170,7 @@ async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, am
              sender_id=from_user_id, receiver_id=to_user_id, amount=amount)
 
     try:
+        
         await _debit(session, from_user_id, amount)
         await _credit(session, to_user_id, amount)
         transfer.status = "SUCCESS"

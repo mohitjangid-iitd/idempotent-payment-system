@@ -1,6 +1,6 @@
 from typing import Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 
 import structlog
 
@@ -68,7 +68,7 @@ async def delete_user(session: AsyncSession, user_id: int) -> User:
     log.info("account_deleted", log_type="BUSINESS", user_id=user.id)
     return user
 
-async def credit_user(session: AsyncSession, user_id: int, amount: int) -> User:
+async def _credit(session: AsyncSession, user_id: int, amount: int) -> User:
     if amount <= 0:
         log.warning("credit_rejected", log_type="REJECT",
                     reason="invalid_amount", user_id=user_id, amount=amount)
@@ -82,16 +82,18 @@ async def credit_user(session: AsyncSession, user_id: int, amount: int) -> User:
 
     balance_read = user.balance
     user.balance += amount
-    await session.commit()
-    await session.refresh(user)
-
     log.debug("balance_changed", log_type="DEBUG-EVIDENCE", op="credit",
               user_id=user_id, amount=amount,
               balance_read=balance_read, balance_written=user.balance)
     return user
 
+async def credit_user(session: AsyncSession, user_id: int, amount: int) -> User:
+    user = await _credit(session, user_id, amount)
+    await session.commit()
+    await session.refresh(user)
+    return user
 
-async def debit_user(session: AsyncSession, user_id: int, amount: int) -> User:
+async def _debit(session: AsyncSession, user_id: int, amount: int) -> User:
     if amount <= 0:
         log.warning("debit_rejected", log_type="REJECT",
                     reason="invalid_amount", user_id=user_id, amount=amount)
@@ -111,14 +113,16 @@ async def debit_user(session: AsyncSession, user_id: int, amount: int) -> User:
 
     balance_read = user.balance
     user.balance -= amount
-    await session.commit()
-    await session.refresh(user)
-
     log.debug("balance_changed", log_type="DEBUG-EVIDENCE", op="debit",
               user_id=user_id, amount=amount,
               balance_read=balance_read, balance_written=user.balance)
     return user
 
+async def debit_user(session: AsyncSession, user_id: int, amount: int) -> User:
+    user = await _debit(session, user_id, amount)    
+    await session.commit()
+    await session.refresh(user)
+    return user
 
 async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, amount: int) -> Transfer:
     if from_user_id == to_user_id:
@@ -131,14 +135,12 @@ async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, am
                     reason="invalid_amount", sender_id=from_user_id, amount=amount)
         raise InvalidTransfer()
 
-    from_user = await get_user(session, from_user_id)
-    if from_user is None:
+    if await get_user(session, from_user_id) is None:
         log.warning("transfer_rejected", log_type="REJECT",
                     reason="sender_not_found", sender_id=from_user_id)
         raise AccountNotFound()
 
-    to_user = await get_user(session, to_user_id)
-    if to_user is None:
+    if await get_user(session, to_user_id) is None:
         log.warning("transfer_rejected", log_type="REJECT",
                     reason="receiver_not_found", receiver_id=to_user_id)
         raise AccountNotFound()
@@ -152,26 +154,28 @@ async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, am
     session.add(transfer)
     await session.commit()
     await session.refresh(transfer)
-    structlog.contextvars.bind_contextvars(transfer_id=transfer.id)
+    transfer_id = transfer.id
+    structlog.contextvars.bind_contextvars(transfer_id=transfer_id)
     log.info("transfer_created", log_type="BUSINESS",
              sender_id=from_user_id, receiver_id=to_user_id, amount=amount)
 
-    if from_user.balance < amount:
-        transfer.status = "FAILED"
+    try:
+        await _debit(session, from_user_id, amount)
+        await _credit(session, to_user_id, amount)
+        transfer.status = "SUCCESS"
         await session.commit()
-        log.warning("transfer_rejected", log_type="REJECT",
-                    reason="insufficient_balance",
-                    sender_id=from_user_id, receiver_id=to_user_id,
-                    amount=amount, sender_balance_read=from_user.balance)
-        raise InsufficientBalance()
+    except Exception as exc:
+        await session.rollback()
+        await session.execute(
+            update(Transfer).where(Transfer.id == transfer_id).values(status="FAILED")
+        )
+        await session.commit()
+        log.warning("transfer_failed", log_type="BUSINESS",
+                    reason=type(exc).__name__,
+                    sender_id=from_user_id, receiver_id=to_user_id, amount=amount)
+        raise
 
-    await debit_user(session, from_user_id, amount)
-    await credit_user(session, to_user_id, amount)
-
-    transfer.status = "SUCCESS"
-    await session.commit()
     await session.refresh(transfer)
-
     log.info("transfer_succeeded", log_type="AUDIT",
              sender_id=from_user_id, receiver_id=to_user_id, amount=amount)
     return transfer

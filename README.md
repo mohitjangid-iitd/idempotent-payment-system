@@ -63,13 +63,15 @@ docker-compose.yml
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
 
 copy .env.example .env        # then fill in the values
 docker compose up -d          # Postgres on port 5433
-python -m alembic upgrade head # create tables
+python -m alembic upgrade head          # create tables
 python -m uvicorn app.main:app --reload --no-access-log
 ```
+
+On Windows, running `uvicorn`, `alembic` or `pytest` directly can be blocked by Application Control ("Application Control policy has blocked this file"). Starting them as `python -m <tool>` avoids that.
 
 Open `http://localhost:8000/docs` for the interactive API.
 

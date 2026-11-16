@@ -52,22 +52,24 @@ async def test_negative_balance(session_factory, make_user):
 async def test_crash_midway(session, session_factory, make_user, monkeypatch):
     a = await make_user("A", 500)
     b = await make_user("B", 0)
+    a_id, b_id = a.id, b.id
 
     async def failing_credit(session, user_id, amount):
         raise RuntimeError("crash between debit and credit")
 
-    monkeypatch.setattr(crud, "credit_user", failing_credit)
+    monkeypatch.setattr(crud, "_credit", failing_credit)    # credit_user nahi, _credit
 
     with pytest.raises(RuntimeError):
-        await crud.transfer(session, a.id, b.id, 200)
+        await crud.transfer(session, a_id, b_id, 200)
 
     # naye session se asli DB state
     async with session_factory() as s:
-        a_after = await crud.get_user(s, a.id)
-        b_after = await crud.get_user(s, b.id)
+        a_after = await crud.get_user(s, a_id)
+        b_after = await crud.get_user(s, b_id)
         rows = (await s.execute(select(Transfer))).scalars().all()
 
-    # sahi behaviour: kuch bhi aadha nahi
+    # sahi behaviour: kuch bhi aadha nahi, aur failure ka record
     assert a_after.balance == 500
     assert b_after.balance == 0
-    assert rows[0].status != "PENDING"
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"

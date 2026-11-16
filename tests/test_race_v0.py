@@ -73,3 +73,28 @@ async def test_crash_midway(session, session_factory, make_user, monkeypatch):
     assert b_after.balance == 0
     assert len(rows) == 1
     assert rows[0].status == "FAILED"
+
+async def transfer_worker(session_factory, from_id, to_id, amount):
+    async with session_factory() as s:
+        return await crud.transfer(s, from_id, to_id, amount)
+
+
+async def test_opposite_transfers_no_deadlock(session_factory, make_user):
+    a = await make_user("A", 1000)
+    b = await make_user("B", 1000)
+    a_id, b_id = a.id, b.id
+
+    results = await asyncio.gather(
+        *[transfer_worker(session_factory, a_id, b_id, 1) for _ in range(20)],
+        *[transfer_worker(session_factory, b_id, a_id, 1) for _ in range(20)],
+        return_exceptions=True,
+    )
+
+    errors = [r for r in results if isinstance(r, Exception)]
+    async with session_factory() as s:
+        a_after = await crud.get_user(s, a_id)
+        b_after = await crud.get_user(s, b_id)
+
+    assert errors == []                    # koi deadlock error nahi
+    assert a_after.balance == 1000         # 20 idhar, 20 udhar, net zero
+    assert b_after.balance == 1000

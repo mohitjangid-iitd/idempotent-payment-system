@@ -145,12 +145,12 @@ async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, am
                     reason="invalid_amount", sender_id=from_user_id, amount=amount)
         raise InvalidTransfer()
 
-    if await get_user_for_update(session, from_user_id) is None:
+    if await get_user(session, from_user_id) is None:
         log.warning("transfer_rejected", log_type="REJECT",
                     reason="sender_not_found", sender_id=from_user_id)
         raise AccountNotFound()
 
-    if await get_user_for_update(session, to_user_id) is None:
+    if await get_user(session, to_user_id) is None:
         log.warning("transfer_rejected", log_type="REJECT",
                     reason="receiver_not_found", receiver_id=to_user_id)
         raise AccountNotFound()
@@ -170,7 +170,8 @@ async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, am
              sender_id=from_user_id, receiver_id=to_user_id, amount=amount)
 
     try:
-        
+        for uid in sorted([from_user_id, to_user_id]):
+            await get_user_for_update(session, uid)        
         await _debit(session, from_user_id, amount)
         await _credit(session, to_user_id, amount)
         transfer.status = "SUCCESS"

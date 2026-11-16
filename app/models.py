@@ -1,5 +1,5 @@
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import BigInteger, String, ForeignKey, DateTime, func
+from sqlalchemy import BigInteger, String, ForeignKey, DateTime, func, CheckConstraint
 from datetime import datetime
 
 class Base(DeclarativeBase):
@@ -7,6 +7,10 @@ class Base(DeclarativeBase):
 
 class User(Base):
     __tablename__ = "user_table"
+
+    __table_args__ = (
+        CheckConstraint("balance >= 0", name="ck_user_balance_non_negative"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(100))

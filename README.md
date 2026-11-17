@@ -10,8 +10,8 @@ Version 0 is deliberately naive: no locks, no transactions around transfers. The
 
 | Version | What changes | Race tests |
 |---|---|---|
-| **v0** (done) | Naive accounts, deposit, withdraw, transfer. No locks. | 3 fail, on purpose |
-| v1 | One DB transaction per transfer, row lock, `CHECK(balance >= 0)` | should pass |
+| **v0** (done, tag `v0-naive`) | Naive accounts, deposit, withdraw, transfer. No locks. | 3 fail, on purpose |
+| **v1** (done, tag `v1-transactions`) | Atomic transfer with rollback, row lock, fixed lock order, `CHECK(balance >= 0)` | all pass, plus a new deadlock test |
 | v2 | Idempotency key + `UNIQUE` constraint, API in Docker with 2 replicas | double-debit test |
 | v3 | Request hash, saved response, `409` (in progress) / `422` (same key, different body) | |
 | v4 | Fake PSP, crash recovery (`recovery_point`, stuck `in_progress`, lock TTL) | |
@@ -28,6 +28,34 @@ Version 0 is deliberately naive: no locks, no transactions around transfers. The
 The numbers change from run to run because they depend on timing. The fixed part is that the expected value is never reached.
 
 The structured logs carry the proof: each `balance_changed` line records `balance_read` and `balance_written`, and many lines show the same `balance_read`.
+
+## v1: what changed and what the tests show
+
+The same race tests that failed in v0 now pass, and one new test found a gap that the first three did not cover.
+
+| Test | v0 | v1 | Fix |
+|---|---|---|---|
+| `test_lost_update` (50 parallel deposits) | balance far below 5000 | 5000 | row lock: `SELECT ... FOR UPDATE`, so each task reads the balance the previous one committed |
+| `test_negative_balance` (10 parallel withdrawals from 100) | 10 successes | 1 success, 9 rejected | same row lock, the balance check and the update are now one locked step |
+| `test_crash_midway` (credit fails after debit) | sender stuck at 300, row `PENDING` | sender back at 500, row `FAILED` | debit, credit and status update are one transaction, any failure rolls it all back |
+| `test_opposite_transfers_no_deadlock` (20 transfers A to B and 20 B to A in parallel) | not tested | 38 of 40 died with `deadlock detected` before the fix, 0 errors after | both accounts are locked in sorted id order, so every transfer takes the same path |
+| `test_db_rejects_negative_balance` (raw SQL `UPDATE ... SET balance = -1`) | not tested | `IntegrityError` | `CHECK (balance >= 0)` in the database, the last line of defense under the app's own check |
+
+How a transfer runs now:
+
+1. Validate the request. Nothing is written if the input is bad.
+2. Insert the transfer row as `PENDING` and commit, so the transfer has a stable id from the start.
+3. In one transaction: lock both accounts in sorted id order, debit, credit, set `SUCCESS`, commit once.
+4. If anything fails: roll back, then mark the same row `FAILED` in a short separate transaction, so the user can still see the failed transfer.
+
+Details worth knowing:
+
+- `get_user_for_update` uses `populate_existing=True`. Without it SQLAlchemy can hand back an object it already holds, with a stale balance, and the lock would protect nothing.
+- A lock is released on commit or rollback, so a lock taken before the `PENDING` commit protects nothing. The real locks are taken after it.
+- After a rollback, session objects are expired. Ids are saved into plain variables before it.
+- The application check (`InsufficientBalance`) gives a clear error. The `CHECK` constraint is the safety net: the database stays correct even if application code is wrong.
+
+Known gap: if marking the row `FAILED` itself fails (for example the database goes down), the row stays `PENDING`. Recovering from that is v4 (crash recovery).
 
 ## Stack
 
@@ -54,7 +82,8 @@ alembic/             migrations
 tests/
   conftest.py        test DB fixtures
   test_accounts.py   28 normal tests
-  test_race_v0.py    race tests (expected to fail in v0)
+  test_race_v0.py    race tests (failed in v0 by design, pass since v1)
+  test_constraints.py  database-level CHECK constraint test
 docker-compose.yml
 ```
 
@@ -131,11 +160,14 @@ Run:
 ```powershell
 python -m pytest -v                          # everything
 python -m pytest tests/test_accounts.py -v   # 28 normal tests, all pass
-python -m pytest tests/test_race_v0.py -v    # race tests, fail in v0 by design
+python -m pytest tests/test_race_v0.py -v    # race tests: fail on the v0-naive tag, pass on v1
+python -m pytest tests/test_constraints.py -v
 ```
+
+To see the v0 bugs yourself, check out the `v0-naive` tag and run the race tests there.
 
 Each test starts from freshly created empty tables (`drop_all` then `create_all`), and `conftest.py` refuses to run if the test database name does not contain `test`.
 
 ## Next
 
-v1: wrap debit, credit and status update in one transaction with a row lock (`SELECT ... FOR UPDATE`) and add `CHECK(balance >= 0)`. Then run the same race tests again. They should pass.
+v2: idempotency. Right now the same transfer sent twice (a retry after a lost response, a double click) is two separate transfers, because the server has no way to know it saw the request before. The client will send an idempotency key, stored with a `UNIQUE` constraint, so a repeated key returns the first result instead of moving money again. The API also moves into Docker with 2 replicas.

@@ -18,7 +18,8 @@ from app.crud import (
 )
 from app.exceptions import (
     AccountNotFound, InsufficientBalance, BalanceNotZero, 
-    InvalidTransfer, RequestBodyChangeError, RequestInProgress
+    InvalidTransfer, RequestBodyChangeError, RequestInProgress,
+    PreviousAttemptFailed
     )
 from app.logging_config import setup_logging
 
@@ -88,6 +89,13 @@ async def request_in_progress_handler(request: Request, exc: RequestInProgress):
         status_code=409,
         content={"detail": "A request with this Idempotency-Key is still in progress, retry shortly"},
         headers={"Retry-After": "1"},
+    )
+
+@app.exception_handler(PreviousAttemptFailed)
+async def previous_attempt_failed_handler(request: Request, exc: PreviousAttemptFailed):
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "The previous attempt with this Idempotency-Key failed, use a new key to try again"},
     )
 
 @app.get("/")

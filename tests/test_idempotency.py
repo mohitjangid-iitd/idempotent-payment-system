@@ -159,3 +159,22 @@ async def test_duplicate_while_first_in_progress_returns_409(client, session_fac
     assert r.status_code == 409
     assert await count_transfers(session_factory) == 1
     assert await balance_of(session_factory, a_id) == 1000   # nothing moved
+
+async def test_retry_of_failed_transfer_is_rejected(client, session_factory, make_user):
+    a = await make_user("A", 1000)
+    b = await make_user("B", 0)
+    a_id, b_id = a.id, b.id
+
+    # simulate an earlier attempt that failed: FAILED row with the key, no money moved
+    async with session_factory() as s:
+        s.add(Transfer(sender_id=a_id, receiver_id=b_id, amount=100,
+                       status="FAILED", idempotency_key="failed-1"))
+        await s.commit()
+
+    body = {"from_account_id": a_id, "to_account_id": b_id, "amount": 100}
+    r = await client.post("/transfers", json=body, headers={"Idempotency-Key": "failed-1"})
+
+    assert r.status_code == 409
+    assert "Retry-After" not in r.headers          # do not retry with the same key
+    assert await count_transfers(session_factory) == 1
+    assert await balance_of(session_factory, a_id) == 1000   # nothing moved

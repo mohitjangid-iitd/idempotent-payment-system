@@ -12,7 +12,7 @@ Version 0 is deliberately naive: no locks, no transactions around transfers. The
 |---|---|---|
 | **v0** (done, tag `v0-naive`) | Naive accounts, deposit, withdraw, transfer. No locks. | 3 fail, on purpose |
 | **v1** (done, tag `v1-transactions`) | Atomic transfer with rollback, row lock, fixed lock order, `CHECK(balance >= 0)` | all pass, plus a new deadlock test |
-| **v2** (design done, Docker part pending) | `Idempotency-Key` header + `UNIQUE(sender_id, key)`, duplicate returns the first transfer. Next: API in Docker with 2 replicas | double-click test passes |
+| **v2** (done, tag `v2-idempotency`) | `Idempotency-Key` header + `UNIQUE(sender_id, key)`, duplicate returns the first transfer. API in Docker, 2 replicas behind nginx | double-click test passes, also across 2 replicas |
 | v3 | Request hash, saved response, `409` (in progress) / `422` (same key, different body) | |
 | v4 | Fake PSP, crash recovery (`recovery_point`, stuck `in_progress`, lock TTL) | |
 | v5 | Double-entry ledger, reconciliation, load test, CI | |
@@ -76,6 +76,25 @@ How it works:
 3. If the key is `None`, or no old row is found, the `IntegrityError` is re-raised, because it was some other error.
 4. `crud.transfer()` returns `(transfer, created)`. The endpoint answers `201` when created and `200` for a duplicate.
 
+### v2: running in Docker with 2 replicas
+
+The API runs as 2 containers behind nginx, all talking to the same Postgres. This proves that idempotency lives in the database (`UNIQUE` constraint), not in one process's memory.
+
+```
+client -> nginx (port 8000) -> api x2 -> postgres
+```
+
+- `Dockerfile` builds the API image, `docker-compose.yml` runs `api` (2 replicas), `nginx` and `postgres`.
+- Inside a container `localhost` is the container itself, so compose overrides `DB_HOST=postgres` and `DB_PORT=5432` for `api`. The local `.env` (`localhost:5433`) is unchanged and still used by pytest and Alembic.
+- `check_concurrent.py` sends 20 parallel requests with the same key through nginx. Result: one `201`, nineteen `200`, one transfer id, money moved once.
+
+Run the whole stack:
+
+```powershell
+docker compose up -d --build
+python check_concurrent.py      # needs the stack running
+```
+
 Design decisions:
 
 - **The key is made by the client** (one UUID per intent, created when the payment screen opens, not on every click). The server never guesses a duplicate from amount or users, otherwise paying the same person the same amount twice on purpose would be blocked.
@@ -119,7 +138,10 @@ tests/
   test_race_v0.py    race tests (failed in v0 by design, pass since v1)
   test_constraints.py  database-level CHECK constraint test
   test_idempotency.py  retry, different keys, double click, API header tests
-docker-compose.yml
+docker-compose.yml   postgres, api (2 replicas), nginx
+Dockerfile
+nginx.conf
+check_concurrent.py  parallel idempotency check against the running stack
 ```
 
 ## Setup
@@ -207,4 +229,4 @@ Each test starts from freshly created empty tables (`drop_all` then `create_all`
 
 ## Next
 
-v2, second part: the API moves into Docker (Dockerfile, `.dockerignore`, `env_file`) and runs as 2 replicas against the same Postgres, so idempotency is proven across processes. After that, v3: request hash, saved response, `409` while a request is in progress, `422` for the same key with a different body.
+v3: request hash, saved response, `409` while a request is in progress (a duplicate that arrives while the first request is still running currently gets the `PENDING` transfer), `422` for the same key with a different body.

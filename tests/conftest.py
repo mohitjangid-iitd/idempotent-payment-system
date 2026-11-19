@@ -1,8 +1,11 @@
+import httpx
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from app import crud
 from app.config import settings
+from app.database import get_db
+from app.main import app
 from app.models import Base
 
 assert "test" in settings.test_db_name
@@ -42,3 +45,17 @@ async def make_user(session):
         return user
 
     return _make
+
+
+@pytest_asyncio.fixture
+async def client(session_factory):
+    # app ka get_db dev DB se judta hai, test mein usse test DB wala session do
+    async def override_get_db():
+        async with session_factory() as s:
+            yield s
+
+    app.dependency_overrides[get_db] = override_get_db
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+    app.dependency_overrides.clear()

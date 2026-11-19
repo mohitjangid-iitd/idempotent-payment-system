@@ -78,3 +78,35 @@ async def test_double_click_same_key_moves_money_once(session_factory, make_user
     assert await count_transfers(session_factory) == 1
     assert await balance_of(session_factory, a_id) == 4900
     assert await balance_of(session_factory, b_id) == 100
+
+
+# ---------- API level: Idempotency-Key header ----------
+
+async def test_header_same_key_moves_money_once(client, session_factory, make_user):
+    a = await make_user("A", 1000)
+    b = await make_user("B", 0)
+    a_id, b_id = a.id, b.id
+
+    body = {"from_account_id": a_id, "to_account_id": b_id, "amount": 100}
+    headers = {"Idempotency-Key": "hdr-1"}
+
+    r1 = await client.post("/transfers", json=body, headers=headers)
+    r2 = await client.post("/transfers", json=body, headers=headers)
+
+    assert r1.json()["id"] == r2.json()["id"]
+    assert await count_transfers(session_factory) == 1
+    assert await balance_of(session_factory, a_id) == 900
+
+
+async def test_no_header_means_separate_transfers(client, session_factory, make_user):
+    a = await make_user("A", 1000)
+    b = await make_user("B", 0)
+    a_id, b_id = a.id, b.id
+
+    body = {"from_account_id": a_id, "to_account_id": b_id, "amount": 100}
+
+    r1 = await client.post("/transfers", json=body)
+    r2 = await client.post("/transfers", json=body)
+
+    assert r1.json()["id"] != r2.json()["id"]
+    assert await balance_of(session_factory, a_id) == 800

@@ -15,3 +15,6 @@ class InvalidTransfer(Exception):
 
 class RequestBodyChangeError(Exception):
     pass
+
+class RequestInProgress(Exception):
+    pass

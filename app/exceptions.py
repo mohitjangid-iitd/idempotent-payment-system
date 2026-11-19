@@ -18,3 +18,6 @@ class RequestBodyChangeError(Exception):
 
 class RequestInProgress(Exception):
     pass
+
+class PreviousAttemptFailed(Exception):
+    pass

@@ -8,7 +8,8 @@ import structlog
 from app.models import User, Transfer
 from app.exceptions import (
     AccountNotFound, InsufficientBalance, BalanceNotZero,
-    InvalidTransfer, RequestBodyChangeError, RequestInProgress
+    InvalidTransfer, RequestBodyChangeError, RequestInProgress,
+    PreviousAttemptFailed
     )
 
 log = structlog.get_logger()
@@ -197,6 +198,13 @@ async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, am
                      transfer_id=existing.id, sender_id=from_user_id,
                      idempotency_key=idempotency_key)
             raise RequestInProgress()
+
+        if existing.status == "FAILED":
+            log.warning("transfer_rejected", log_type="REJECT",
+                        reason="idempotency_key_previous_attempt_failed",
+                        sender_id=from_user_id, idempotency_key=idempotency_key,
+                        existing_transfer_id=existing.id)
+            raise PreviousAttemptFailed()
 
         log.info("transfer_duplicate_key", log_type="CONCURRENCY",
                  transfer_id=existing.id, sender_id=from_user_id,

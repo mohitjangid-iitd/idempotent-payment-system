@@ -129,7 +129,7 @@ async def test_transfer_success(session, make_user):
     a = await make_user("A", 500)
     b = await make_user("B", 100)
 
-    t = await crud.transfer(session, a.id, b.id, 200)
+    t, _ = await crud.transfer(session, a.id, b.id, 200)
 
     await session.refresh(a)
     await session.refresh(b)

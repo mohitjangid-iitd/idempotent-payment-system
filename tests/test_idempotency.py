@@ -21,7 +21,7 @@ async def balance_of(session_factory, user_id) -> int:
 async def key_worker(session_factory, from_id, to_id, amount, key) -> int:
     # har call = ek alag "request", apna session
     async with session_factory() as s:
-        t = await crud.transfer(s, from_id, to_id, amount, idempotency_key=key)
+        t, _ = await crud.transfer(s, from_id, to_id, amount, idempotency_key=key)
         return t.id
 
 
@@ -98,15 +98,27 @@ async def test_header_same_key_moves_money_once(client, session_factory, make_us
     assert await balance_of(session_factory, a_id) == 900
 
 
-async def test_no_header_means_separate_transfers(client, session_factory, make_user):
+async def test_missing_header_is_rejected(client, session_factory, make_user):
     a = await make_user("A", 1000)
     b = await make_user("B", 0)
     a_id, b_id = a.id, b.id
 
     body = {"from_account_id": a_id, "to_account_id": b_id, "amount": 100}
+    r = await client.post("/transfers", json=body)
 
-    r1 = await client.post("/transfers", json=body)
-    r2 = await client.post("/transfers", json=body)
+    assert r.status_code == 422
+    assert await count_transfers(session_factory) == 0
+    assert await balance_of(session_factory, a_id) == 1000
+
+
+async def test_different_header_keys_are_separate_transfers(client, session_factory, make_user):
+    a = await make_user("A", 1000)
+    b = await make_user("B", 0)
+    a_id, b_id = a.id, b.id
+
+    body = {"from_account_id": a_id, "to_account_id": b_id, "amount": 100}
+    r1 = await client.post("/transfers", json=body, headers={"Idempotency-Key": "k1"})
+    r2 = await client.post("/transfers", json=body, headers={"Idempotency-Key": "k2"})
 
     assert r1.json()["id"] != r2.json()["id"]
     assert await balance_of(session_factory, a_id) == 800

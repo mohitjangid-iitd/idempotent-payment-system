@@ -122,3 +122,21 @@ async def test_different_header_keys_are_separate_transfers(client, session_fact
 
     assert r1.json()["id"] != r2.json()["id"]
     assert await balance_of(session_factory, a_id) == 800
+
+async def test_same_key_different_body_is_rejected(client, session_factory, make_user):
+    a = await make_user("A", 1000)
+    b = await make_user("B", 0)
+    a_id, b_id = a.id, b.id
+
+    headers = {"Idempotency-Key": "mismatch-1"}
+    first = {"from_account_id": a_id, "to_account_id": b_id, "amount": 100}
+    second = {"from_account_id": a_id, "to_account_id": b_id, "amount": 500}
+
+    r1 = await client.post("/transfers", json=first, headers=headers)
+    r2 = await client.post("/transfers", json=second, headers=headers)
+
+    assert r1.status_code == 201
+    assert r2.status_code == 422                       # same key, different body
+    assert await count_transfers(session_factory) == 1
+    assert await balance_of(session_factory, a_id) == 900   # only the first moved money
+    assert await balance_of(session_factory, b_id) == 100

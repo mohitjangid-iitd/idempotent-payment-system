@@ -6,7 +6,9 @@ from sqlalchemy.exc import IntegrityError
 import structlog
 
 from app.models import User, Transfer
-from app.exceptions import AccountNotFound, InsufficientBalance, BalanceNotZero, InvalidTransfer
+from app.exceptions import (AccountNotFound, 
+        InsufficientBalance, BalanceNotZero, InvalidTransfer,
+        RequestBodyChangeError)
 
 log = structlog.get_logger()
 
@@ -135,7 +137,7 @@ async def debit_user(session: AsyncSession, user_id: int, amount: int) -> User:
     await session.refresh(user)
     return user
 
-async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, amount: int, idempotency_key: Optional[str] = None) -> Transfer:
+async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, amount: int, idempotency_key: Optional[str] = None) -> tuple[Transfer, bool]:
     if from_user_id == to_user_id:
         log.warning("transfer_rejected", log_type="REJECT",
                     reason="self_transfer", sender_id=from_user_id)
@@ -171,7 +173,6 @@ async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, am
         if idempotency_key is None:
             raise
 
-        # 2) purani transfer dhundho (plain parameters use kiye, ORM attributes nahi)
         result = await session.execute(
             select(Transfer).where(
                 Transfer.sender_id == from_user_id,
@@ -181,9 +182,15 @@ async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, am
         existing = result.scalar_one_or_none()
 
         if existing is None:
-            raise                      # key ka clash nahi tha, koi aur IntegrityError, upar jaane do
-
-        # 3) wahi purani transfer wapas, debit-credit nahi chalega
+            raise
+        
+        if existing.receiver_id != to_user_id or existing.amount != amount:
+            log.warning("transfer_rejected", log_type="REJECT",
+                        reason="idempotency_key_body_mismatch",
+                        sender_id=from_user_id, idempotency_key=idempotency_key,
+                        existing_transfer_id=existing.id)
+            raise RequestBodyChangeError()
+        
         log.info("transfer_duplicate_key", log_type="CONCURRENCY",
                  transfer_id=existing.id, sender_id=from_user_id,
                  idempotency_key=idempotency_key)

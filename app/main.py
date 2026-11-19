@@ -18,7 +18,7 @@ from app.crud import (
 )
 from app.exceptions import (
     AccountNotFound, InsufficientBalance, BalanceNotZero, 
-    InvalidTransfer
+    InvalidTransfer, RequestBodyChangeError
     )
 from app.logging_config import setup_logging
 
@@ -75,6 +75,12 @@ async def invalid_transfer_handler(request: Request, exc: InvalidTransfer):
         content={"detail": "Invalid transfer request"}
     )
 
+@app.exception_handler(RequestBodyChangeError)
+async def request_body_change_handler(request: Request, exc: RequestBodyChangeError):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": "Idempotency-Key was already used with a different request body"}
+    )
 
 @app.get("/")
 def read_root():

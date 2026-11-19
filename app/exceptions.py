@@ -12,3 +12,6 @@ class UserAlreadyExists(Exception):
 
 class InvalidTransfer(Exception):
     pass
+
+class RequestBodyChangeError(Exception):
+    pass

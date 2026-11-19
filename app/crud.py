@@ -6,9 +6,10 @@ from sqlalchemy.exc import IntegrityError
 import structlog
 
 from app.models import User, Transfer
-from app.exceptions import (AccountNotFound, 
-        InsufficientBalance, BalanceNotZero, InvalidTransfer,
-        RequestBodyChangeError)
+from app.exceptions import (
+    AccountNotFound, InsufficientBalance, BalanceNotZero,
+    InvalidTransfer, RequestBodyChangeError, RequestInProgress
+    )
 
 log = structlog.get_logger()
 
@@ -191,6 +192,12 @@ async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, am
                         existing_transfer_id=existing.id)
             raise RequestBodyChangeError()
         
+        if existing.status == "PENDING":
+            log.info("transfer_in_progress", log_type="CONCURRENCY",
+                     transfer_id=existing.id, sender_id=from_user_id,
+                     idempotency_key=idempotency_key)
+            raise RequestInProgress()
+
         log.info("transfer_duplicate_key", log_type="CONCURRENCY",
                  transfer_id=existing.id, sender_id=from_user_id,
                  idempotency_key=idempotency_key)

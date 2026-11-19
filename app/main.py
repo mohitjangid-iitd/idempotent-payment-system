@@ -123,20 +123,9 @@ async def withdraw(account_id: int, body: AmountIn, session: AsyncSession = Depe
     return user
 
 @app.post("/transfers", response_model=TransferOut, status_code=201)
-async def create_transfer(
-    body: TransferIn,
-    session: AsyncSession = Depends(get_db),
-    idempotency_key: str | None = Header(default=None, max_length=64),
-):
-    return await transfer(
-        session, body.from_account_id, body.to_account_id, body.amount,
-        idempotency_key=idempotency_key,
-    )
-
-# @app.post("/transfers", response_model=TransferOut, status_code=201)
-# async def create_transfer(body: TransferIn, session: AsyncSession = Depends(get_db), idempotency_key: str = Header( max_length=64)):
-#     result, created = await transfer(session, body.from_account_id, body.to_account_id, body.amount, idempotency_key=idempotency_key)
-#     if not created:
-#         response.status_code = 200
-#     return result
+async def create_transfer(response:Response, body: TransferIn, session: AsyncSession = Depends(get_db), idempotency_key: str = Header(min_length=1, max_length=64)):
+    result, created = await transfer(session, body.from_account_id, body.to_account_id, body.amount, idempotency_key=idempotency_key)
+    if not created:
+        response.status_code = 200
+    return result
 

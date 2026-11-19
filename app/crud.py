@@ -187,7 +187,7 @@ async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, am
         log.info("transfer_duplicate_key", log_type="CONCURRENCY",
                  transfer_id=existing.id, sender_id=from_user_id,
                  idempotency_key=idempotency_key)
-        return existing
+        return existing, False
 
     await session.refresh(transfer)
 
@@ -217,4 +217,4 @@ async def transfer(session: AsyncSession, from_user_id: int, to_user_id: int, am
     await session.refresh(transfer)
     log.info("transfer_succeeded", log_type="AUDIT",
              sender_id=from_user_id, receiver_id=to_user_id, amount=amount)
-    return transfer
+    return transfer, True

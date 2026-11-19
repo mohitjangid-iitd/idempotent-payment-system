@@ -13,7 +13,7 @@ Version 0 is deliberately naive: no locks, no transactions around transfers. The
 | **v0** (done, tag `v0-naive`) | Naive accounts, deposit, withdraw, transfer. No locks. | 3 fail, on purpose |
 | **v1** (done, tag `v1-transactions`) | Atomic transfer with rollback, row lock, fixed lock order, `CHECK(balance >= 0)` | all pass, plus a new deadlock test |
 | **v2** (done, tag `v2-idempotency`) | `Idempotency-Key` header + `UNIQUE(sender_id, key)`, duplicate returns the first transfer. API in Docker, 2 replicas behind nginx | double-click test passes, also across 2 replicas |
-| v3 | Request hash, saved response, `409` (in progress) / `422` (same key, different body) | |
+| **v3** (done, tag `v3-request-checks`) | The key now checks what it points to: same key with a different body is `422`, a duplicate while the first request runs is `409` + `Retry-After`, a retry of a failed transfer is `409` (use a new key) | double-click test still passes, duplicates get `200` or `409` |
 | v4 | Fake PSP, crash recovery (`recovery_point`, stuck `in_progress`, lock TTL) | |
 | v5 | Double-entry ledger, reconciliation, load test, CI | |
 
@@ -86,7 +86,7 @@ client -> nginx (port 8000) -> api x2 -> postgres
 
 - `Dockerfile` builds the API image, `docker-compose.yml` runs `api` (2 replicas), `nginx` and `postgres`.
 - Inside a container `localhost` is the container itself, so compose overrides `DB_HOST=postgres` and `DB_PORT=5432` for `api`. The local `.env` (`localhost:5433`) is unchanged and still used by pytest and Alembic.
-- `check_concurrent.py` sends 20 parallel requests with the same key through nginx. Result: one `201`, nineteen `200`, one transfer id, money moved once.
+- `check_concurrent.py` sends 20 parallel requests with the same key through nginx and retries on `409` like a real client. Result: one `201`, nineteen `200`, one transfer id, money moved once.
 
 Run the whole stack:
 
@@ -103,12 +103,45 @@ Design decisions:
 - **Postgres treats `NULL` as distinct inside `UNIQUE`**, so rows without a key never conflict with each other.
 - **The database is the saved result.** The old `transfers` row is what a retry gets back. Redis could later make this faster, but correctness stays in Postgres.
 
-Known gaps (planned for v3):
+Known gaps in v2 (the first three are fixed in v3, see below):
 
-- A duplicate that arrives while the first request is still running gets the transfer with status `PENDING`. v3 will answer `409` (in progress).
-- A retry of a `FAILED` transfer with the same key returns the `FAILED` row. A new attempt needs a new key.
-- Same key with a different body is not detected yet. v3 adds a request hash and `422`.
-- Validation runs before the key lookup, so a retry after the receiver was deleted gets `404` instead of the old result.
+- A duplicate that arrives while the first request is still running gets the transfer with status `PENDING`.
+- A retry of a `FAILED` transfer with the same key returns the `FAILED` row with `200`.
+- Same key with a different body is not detected.
+- Validation runs before the key lookup, so a retry after the receiver was deleted gets `404` instead of the old result (still open).
+
+## v3: the key checks what it points to
+
+v2 found the old transfer by `sender_id` and key and returned it, whatever it looked like. Three cases gave a misleading `200`. v3 looks at the old transfer before answering.
+
+| Situation | v2 | v3 |
+|---|---|---|
+| same key, different `receiver_id` or `amount` | `200`, the old transfer returned silently | `422`, nothing written |
+| same key while the first request is still running (`PENDING`) | `200` with a `PENDING` transfer | `409` with `Retry-After: 1` |
+| same key after the first attempt `FAILED` | `200` with a `FAILED` transfer (looks like success to a client that only checks the HTTP status) | `409` without `Retry-After`: use a new key |
+| same key, same body, first attempt `SUCCESS` | `200` | `200` (unchanged) |
+| double click (20 parallel, same key) | no errors | one transfer, duplicates get `200` or `409`, no other error |
+
+How it works. After the `IntegrityError` and the lookup of the old transfer (`existing`), `transfer()` checks in this order:
+
+1. `receiver_id` or `amount` differs from the new request: log `REJECT`, raise a named exception, the handler answers `422`.
+2. `existing.status == "PENDING"`: log `CONCURRENCY`, raise a named exception, the handler answers `409` with `Retry-After`.
+3. `existing.status == "FAILED"`: log `REJECT`, raise a named exception, the handler answers `409` without `Retry-After`.
+4. Otherwise (`SUCCESS`): return the old transfer, `200`.
+
+What a client does with the answers: `409` with `Retry-After` means send the same request again shortly. `409` without it means this key is finished, create a new key and a new attempt.
+
+Design decisions:
+
+- **Field comparison, not a hash.** The old row already holds `receiver_id` and `amount`, so the request is compared field by field. `sender_id` is not compared because the lookup already matched it. `status` and `created_at` are not compared because the server made them and they change between attempts. A stored `request_hash` would scale to bigger bodies and other endpoints, and is a possible later step.
+- **One key is one intent, so one outcome.** A failed attempt is final for its key. A new attempt is a new intent and gets a new key. Replaying the original error (for example the first `400 Insufficient balance`) would need the saved response, which is not stored yet.
+- **The check lives in `crud`, not in the endpoint.** The old row and the new request are both there, and `transfer()` can be called without the API.
+- **Tests change when a decision changes.** The v2 double-click test said "no errors at all"; it now allows only the in-progress exception and still asserts one row and money moved once.
+
+Known limitations:
+
+- If the first request dies half way and leaves the row `PENDING`, every retry with that key gets `409` until the row is repaired. Money is safe, the client can start over with a new key. Fixing the stuck row safely (a slow request must not be mistaken for a dead one) is crash recovery, planned for v4.
+- Validation still runs before the key lookup (see above).
 
 ## Stack
 
@@ -128,7 +161,7 @@ app/
   models.py          User (wallet) and Transfer tables (with idempotency_key)
   schemas.py         request and response shapes
   crud.py            all DB work (accounts, deposit, withdraw, transfer)
-  exceptions.py      AccountNotFound, InsufficientBalance, BalanceNotZero, InvalidTransfer
+  exceptions.py      named exceptions: accounts, transfers, reused or unfinished idempotency keys
   logging_config.py  structlog setup
   main.py            routes, exception handlers, request logging middleware
 alembic/             migrations
@@ -137,7 +170,7 @@ tests/
   test_accounts.py   28 normal tests
   test_race_v0.py    race tests (failed in v0 by design, pass since v1)
   test_constraints.py  database-level CHECK constraint test
-  test_idempotency.py  retry, different keys, double click, API header tests
+  test_idempotency.py  retry, different keys, double click, header, key reuse, in progress, failed retry
 docker-compose.yml   postgres, api (2 replicas), nginx
 Dockerfile
 nginx.conf
@@ -174,10 +207,10 @@ Open `http://localhost:8000/docs` for the interactive API.
 | DELETE | `/accounts/{id}` | soft delete, allowed only if balance is 0 |
 | POST | `/accounts/{id}/deposit` | add money |
 | POST | `/accounts/{id}/withdraw` | take money out |
-| POST | `/transfers` | move money from one account to another. Needs an `Idempotency-Key` header (max 64 chars). `201` new, `200` duplicate |
+| POST | `/transfers` | move money from one account to another. Needs an `Idempotency-Key` header (max 64 chars). `201` new, `200` duplicate of a finished transfer |
 | GET | `/health` | API and DB check |
 
-Errors: `404` account not found, `409` balance must be zero to close, `400` insufficient balance or invalid transfer, `422` request body or `Idempotency-Key` header failed validation.
+Errors: `404` account not found, `409` balance must be zero to close, `400` insufficient balance or invalid transfer, `422` request body or `Idempotency-Key` header failed validation, or the key was already used with a different body. For `/transfers`, `409` also means the first request with this key is still in progress (`Retry-After` is set) or has failed (use a new key).
 
 ## Design decisions
 
@@ -200,7 +233,7 @@ JSON lines on stdout, every line has a `request_id`. Each line also has a `log_t
 | REJECT | a business rule refused the action (warning) |
 | AUDIT | money moved: when, who, how much |
 | DEBUG-EVIDENCE | balance read and balance written, for race debugging (debug level only) |
-| CONCURRENCY | duplicate key, retries, deadlocks (`transfer_duplicate_key`) |
+| CONCURRENCY | duplicate key, request in progress, deadlocks (`transfer_duplicate_key`, `transfer_in_progress`) |
 | ERROR | unexpected failures |
 
 Secrets (passwords, `DATABASE_URL`) are never logged.
@@ -216,11 +249,11 @@ docker compose exec postgres psql -U <DB_USER> -d <DB_NAME> -c "CREATE DATABASE 
 Run:
 
 ```powershell
-python -m pytest -v                          # everything
+python -m pytest -v                          # everything (42 tests)
 python -m pytest tests/test_accounts.py -v   # 28 normal tests, all pass
 python -m pytest tests/test_race_v0.py -v    # race tests: fail on the v0-naive tag, pass on v1
 python -m pytest tests/test_constraints.py -v
-python -m pytest tests/test_idempotency.py -v  # 6 tests: crud level and API level
+python -m pytest tests/test_idempotency.py -v  # 9 tests: crud level and API level
 ```
 
 To see the v0 bugs yourself, check out the `v0-naive` tag and run the race tests there.
@@ -229,4 +262,8 @@ Each test starts from freshly created empty tables (`drop_all` then `create_all`
 
 ## Next
 
-v3: request hash, saved response, `409` while a request is in progress (a duplicate that arrives while the first request is still running currently gets the `PENDING` transfer), `422` for the same key with a different body.
+Planned, not started:
+
+- **v4:** a fake payment gateway (PSP) and crash recovery (`recovery_point`, stuck `PENDING` rows, lock TTL), which also removes the stuck-key limitation above.
+- **v5:** double-entry ledger, reconciliation, load test, CI.
+- Possible smaller steps: a stored `request_hash`, a saved response so a retry replays the original answer, idempotency for deposit and withdraw.

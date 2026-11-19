@@ -12,7 +12,7 @@ Version 0 is deliberately naive: no locks, no transactions around transfers. The
 |---|---|---|
 | **v0** (done, tag `v0-naive`) | Naive accounts, deposit, withdraw, transfer. No locks. | 3 fail, on purpose |
 | **v1** (done, tag `v1-transactions`) | Atomic transfer with rollback, row lock, fixed lock order, `CHECK(balance >= 0)` | all pass, plus a new deadlock test |
-| v2 | Idempotency key + `UNIQUE` constraint, API in Docker with 2 replicas | double-debit test |
+| **v2** (design done, Docker part pending) | `Idempotency-Key` header + `UNIQUE(sender_id, key)`, duplicate returns the first transfer. Next: API in Docker with 2 replicas | double-click test passes |
 | v3 | Request hash, saved response, `409` (in progress) / `422` (same key, different body) | |
 | v4 | Fake PSP, crash recovery (`recovery_point`, stuck `in_progress`, lock TTL) | |
 | v5 | Double-entry ledger, reconciliation, load test, CI | |
@@ -57,6 +57,40 @@ Details worth knowing:
 
 Known gap: if marking the row `FAILED` itself fails (for example the database goes down), the row stays `PENDING`. Recovering from that is v4 (crash recovery).
 
+## v2: idempotency (what changed)
+
+The same transfer sent twice (retry after a lost response, double click) used to move money twice. Now the client sends an `Idempotency-Key` header, and a repeated key returns the first transfer instead of moving money again.
+
+| Test | Before | v2 |
+|---|---|---|
+| retry, same key twice | 2 transfers, money moved twice | 1 transfer, same id returned, money moved once |
+| different keys | n/a | 2 separate transfers (no over-deduplication) |
+| double click (20 parallel requests, same key) | 20 transfers | 1 transfer, no errors, all 20 get the same id |
+| API: same header twice | n/a | first `201`, second `200`, one row, balance debited once |
+| API: header missing | n/a | `422`, nothing written |
+
+How it works:
+
+1. `transfers.idempotency_key` (nullable `varchar(64)`) and `UNIQUE(sender_id, idempotency_key)` (`uq_transfer_sender_key`), added by an Alembic migration.
+2. `transfer()` inserts the `PENDING` row and commits. If the database raises `IntegrityError`, the key was already used: roll back, look up the old transfer by `sender_id` and key, and return it. No debit or credit runs.
+3. If the key is `None`, or no old row is found, the `IntegrityError` is re-raised, because it was some other error.
+4. `crud.transfer()` returns `(transfer, created)`. The endpoint answers `201` when created and `200` for a duplicate.
+
+Design decisions:
+
+- **The key is made by the client** (one UUID per intent, created when the payment screen opens, not on every click). The server never guesses a duplicate from amount or users, otherwise paying the same person the same amount twice on purpose would be blocked.
+- **The unique constraint includes `sender_id`**, so two senders who happen to use the same key do not collide, and one sender never sees another sender's transfer.
+- **The header is required on the API** (missing means `422`), because a money-moving retry without a key is exactly the double debit this version removes. `crud.transfer()` still accepts `None` for internal callers.
+- **Postgres treats `NULL` as distinct inside `UNIQUE`**, so rows without a key never conflict with each other.
+- **The database is the saved result.** The old `transfers` row is what a retry gets back. Redis could later make this faster, but correctness stays in Postgres.
+
+Known gaps (planned for v3):
+
+- A duplicate that arrives while the first request is still running gets the transfer with status `PENDING`. v3 will answer `409` (in progress).
+- A retry of a `FAILED` transfer with the same key returns the `FAILED` row. A new attempt needs a new key.
+- Same key with a different body is not detected yet. v3 adds a request hash and `422`.
+- Validation runs before the key lookup, so a retry after the receiver was deleted gets `404` instead of the old result.
+
 ## Stack
 
 - Python, FastAPI, Pydantic
@@ -64,7 +98,7 @@ Known gap: if marking the row `FAILED` itself fails (for example the database go
 - SQLAlchemy 2.0 async ORM with asyncpg
 - Alembic migrations (tables are created only through Alembic)
 - structlog (JSON logs to stdout, one `request_id` per request)
-- pytest, pytest-asyncio
+- pytest, pytest-asyncio, httpx
 
 ## Project layout
 
@@ -72,7 +106,7 @@ Known gap: if marking the row `FAILED` itself fails (for example the database go
 app/
   config.py          settings from .env (pydantic-settings)
   database.py        async engine, session factory, get_db dependency
-  models.py          User (wallet) and Transfer tables
+  models.py          User (wallet) and Transfer tables (with idempotency_key)
   schemas.py         request and response shapes
   crud.py            all DB work (accounts, deposit, withdraw, transfer)
   exceptions.py      AccountNotFound, InsufficientBalance, BalanceNotZero, InvalidTransfer
@@ -80,10 +114,11 @@ app/
   main.py            routes, exception handlers, request logging middleware
 alembic/             migrations
 tests/
-  conftest.py        test DB fixtures
+  conftest.py        test DB fixtures (engine, session_factory, make_user, client)
   test_accounts.py   28 normal tests
   test_race_v0.py    race tests (failed in v0 by design, pass since v1)
   test_constraints.py  database-level CHECK constraint test
+  test_idempotency.py  retry, different keys, double click, API header tests
 docker-compose.yml
 ```
 
@@ -117,10 +152,10 @@ Open `http://localhost:8000/docs` for the interactive API.
 | DELETE | `/accounts/{id}` | soft delete, allowed only if balance is 0 |
 | POST | `/accounts/{id}/deposit` | add money |
 | POST | `/accounts/{id}/withdraw` | take money out |
-| POST | `/transfers` | move money from one account to another |
+| POST | `/transfers` | move money from one account to another. Needs an `Idempotency-Key` header (max 64 chars). `201` new, `200` duplicate |
 | GET | `/health` | API and DB check |
 
-Errors: `404` account not found, `409` balance must be zero to close, `400` insufficient balance or invalid transfer, `422` request body failed validation.
+Errors: `404` account not found, `409` balance must be zero to close, `400` insufficient balance or invalid transfer, `422` request body or `Idempotency-Key` header failed validation.
 
 ## Design decisions
 
@@ -143,6 +178,7 @@ JSON lines on stdout, every line has a `request_id`. Each line also has a `log_t
 | REJECT | a business rule refused the action (warning) |
 | AUDIT | money moved: when, who, how much |
 | DEBUG-EVIDENCE | balance read and balance written, for race debugging (debug level only) |
+| CONCURRENCY | duplicate key, retries, deadlocks (`transfer_duplicate_key`) |
 | ERROR | unexpected failures |
 
 Secrets (passwords, `DATABASE_URL`) are never logged.
@@ -162,6 +198,7 @@ python -m pytest -v                          # everything
 python -m pytest tests/test_accounts.py -v   # 28 normal tests, all pass
 python -m pytest tests/test_race_v0.py -v    # race tests: fail on the v0-naive tag, pass on v1
 python -m pytest tests/test_constraints.py -v
+python -m pytest tests/test_idempotency.py -v  # 6 tests: crud level and API level
 ```
 
 To see the v0 bugs yourself, check out the `v0-naive` tag and run the race tests there.
@@ -170,4 +207,4 @@ Each test starts from freshly created empty tables (`drop_all` then `create_all`
 
 ## Next
 
-v2: idempotency. Right now the same transfer sent twice (a retry after a lost response, a double click) is two separate transfers, because the server has no way to know it saw the request before. The client will send an idempotency key, stored with a `UNIQUE` constraint, so a repeated key returns the first result instead of moving money again. The API also moves into Docker with 2 replicas.
+v2, second part: the API moves into Docker (Dockerfile, `.dockerignore`, `env_file`) and runs as 2 replicas against the same Postgres, so idempotency is proven across processes. After that, v3: request hash, saved response, `409` while a request is in progress, `422` for the same key with a different body.
